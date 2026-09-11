@@ -1,0 +1,4 @@
+#!/bin/bash
+# Compress ANIMATION: AV1 video (VMAF >= 90) + Opus audio (SI-SDR >= 15 dB).
+SCRIPT_DIR=$(dirname "$(realpath "$0")")
+exec python3 "${SCRIPT_DIR}/mkv_encode.py" --profile animation -- "$@"

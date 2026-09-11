@@ -1,0 +1,4 @@
+#!/bin/bash
+# Compress FILM: AV1 video (VMAF >= 94) + Opus audio (SI-SDR >= 18 dB).
+SCRIPT_DIR=$(dirname "$(realpath "$0")")
+exec python3 "${SCRIPT_DIR}/mkv_encode.py" --profile film -- "$@"
