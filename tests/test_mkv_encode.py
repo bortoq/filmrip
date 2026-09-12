@@ -484,6 +484,21 @@ def test_cleanup_stale_tmp_encode(tmp_path):
     assert not stale.exists()
 
 
+def test_cleanup_stale_abav1_dirs(tmp_path, monkeypatch):
+    film = tmp_path / "film.mkv"
+    film.write_bytes(b"x")
+    leftover = tmp_path / ".ab-av1-oldRunXYZ"
+    leftover.mkdir()
+    (leftover / "sample.mkv").write_bytes(b"1")
+    cwd_leftover = tmp_path / ".ab-av1-cwdJunk"
+    # pretend cwd is tmp_path so we also sweep "cwd" leftovers
+    monkeypatch.chdir(tmp_path)
+    cwd_leftover.mkdir()
+    assert m.cleanup_stale_temps(str(film)) is True
+    assert not leftover.exists()
+    assert not cwd_leftover.exists()
+
+
 def test_cleanup_generated_removes_registered(tmp_path):
     f = tmp_path / "out_tmp_encode.mkv"
     f.write_bytes(b"x")
@@ -535,21 +550,28 @@ def test_crf_search_parses_json_done(monkeypatch):
         seen["kwargs"] = k
         return _FakePopen(lines)
 
+    monkeypatch.setattr(m, "ensure_abav1_temp", lambda: "/tmp/fake_abav1")
     monkeypatch.setattr(m.subprocess, "Popen", fake_popen)
     assert m.run_crf_search("f.mkv", 94) == 63.75
     # stderr must stay inherited (None) so ab-av1 keeps its TTY bar
     assert seen["kwargs"].get("stderr") is None
     assert "--stdout-format" in seen["cmd"]
     assert "json" in seen["cmd"]
+    assert "--temp-dir" in seen["cmd"]
+    assert "/tmp/fake_abav1" in seen["cmd"]
+    assert seen["kwargs"].get("start_new_session") is True
 
 
 def test_crf_search_failure_rc(monkeypatch):
+    monkeypatch.setattr(m, "ensure_abav1_temp", lambda: "/tmp/fake_abav1")
     monkeypatch.setattr(m.subprocess, "Popen",
                         lambda *a, **k: _FakePopen([], returncode=1))
     assert m.run_crf_search("f.mkv", 94) is None
 
 
 def test_crf_search_no_binary(monkeypatch):
+    monkeypatch.setattr(m, "ensure_abav1_temp", lambda: "/tmp/fake_abav1")
+
     def boom(*a, **k):
         raise FileNotFoundError("no ab-av1")
     monkeypatch.setattr(m.subprocess, "Popen", boom)
@@ -560,17 +582,22 @@ def test_crf_search_kills_child_on_abort(monkeypatch):
     log = []
 
     class _BoomStdout(_FakePopen):
+        pid = 4242
+
         def __iter__(self):
             raise RuntimeError("interrupted")
 
+    monkeypatch.setattr(m, "ensure_abav1_temp", lambda: "/tmp/fake_abav1")
     monkeypatch.setattr(m.subprocess, "Popen",
-                        lambda *a, **k: _BoomStdout([], kill_log=log))
+                        lambda *a, **k: _BoomStdout([]))
+    monkeypatch.setattr(m.os, "killpg",
+                        lambda pid, sig: log.append((pid, sig)))
     try:
         m.run_crf_search("f.mkv", 94)
         assert False, "must re-raise"
     except RuntimeError:
         pass
-    assert log == [True]
+    assert log and log[0][0] == 4242
 
 
 def test_crf_search_guards():

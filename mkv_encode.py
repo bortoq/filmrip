@@ -52,13 +52,17 @@ LOSSLESS_CODECS = {"flac", "alac", "mlp", "truehd",
 STATIC_FALLBACK = {1: 24, 2: 48, 6: 144, 7: 168, 8: 192}
 
 # Temp-dir prefixes created by this script (cleaned on start / exit).
-_TMP_PREFIXES = ("mkv_audio_", "mkv_abrest_")
+_TMP_PREFIXES = ("mkv_audio_", "mkv_abrest_", "mkv_abav1_")
+# ab-av1 sample dirs (created in cwd / next to the input unless --temp-dir).
+_ABAV1_DIR_PREFIX = ".ab-av1-"
 
 # Paths and child processes to drop on abort / exit.
 _CLEANUP_FILES = set()
 _CLEANUP_DIRS = set()
 _CHILD_PROCS = []
 _CLEANING = False
+# Dedicated --temp-dir for ab-av1 crf-search (this run).
+_ABAV1_TEMP = None
 
 
 def eprint(msg):
@@ -89,13 +93,33 @@ def _unregister_dir(path):
 
 
 def _kill_children():
+    """Terminate ab-av1 / ffmpeg process groups, then force-kill if needed."""
     for p in list(_CHILD_PROCS):
+        pid = getattr(p, "pid", None)
+        if not pid:
+            continue
+        # Prefer killing the whole session (ab-av1 + ffmpeg children).
         try:
-            p.kill()
+            os.killpg(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        try:
+            p.wait(timeout=3)
+            continue
         except Exception:
             pass
         try:
-            p.wait(timeout=5)
+            os.killpg(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                p.kill()
+            except Exception:
+                pass
+        try:
+            p.wait(timeout=2)
         except Exception:
             pass
     _CHILD_PROCS.clear()
@@ -103,7 +127,7 @@ def _kill_children():
 
 def cleanup_generated(quiet=True):
     """Remove temp files/dirs produced by this run; kill child processes."""
-    global _CLEANING
+    global _CLEANING, _ABAV1_TEMP
     if _CLEANING:
         return
     _CLEANING = True
@@ -124,26 +148,41 @@ def cleanup_generated(quiet=True):
             except OSError:
                 pass
             _CLEANUP_DIRS.discard(path)
+        _ABAV1_TEMP = None
     finally:
         _CLEANING = False
 
 
-def cleanup_stale_temps(input_path=None):
-    """Drop leftovers from a previous killed / power-loss run."""
-    if input_path:
-        base, ext = os.path.splitext(os.path.realpath(input_path))
-        stale = base + "_tmp_encode" + ext
-        if os.path.isfile(stale):
-            try:
-                os.remove(stale)
-            except OSError as e:
-                eprint(f"Cannot remove stale temp file {stale}: {e}")
-                return False
+def _is_abav1_dir_name(name):
+    return isinstance(name, str) and name.startswith(_ABAV1_DIR_PREFIX)
+
+
+def _rm_abav1_dirs_in(parent):
+    """Remove every .ab-av1-* directory under parent."""
+    if not parent:
+        return
+    try:
+        names = os.listdir(parent)
+    except OSError:
+        return
+    for name in names:
+        if not _is_abav1_dir_name(name):
+            continue
+        path = os.path.join(parent, name)
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def _rm_prefixed_in_tmpdir():
+    """Remove /tmp/mkv_audio_*, mkv_abrest_*, mkv_abav1_* leftovers."""
     tmp_root = tempfile.gettempdir()
     try:
         names = os.listdir(tmp_root)
     except OSError:
-        return True
+        return
     for name in names:
         if not any(name.startswith(p) for p in _TMP_PREFIXES):
             continue
@@ -155,7 +194,50 @@ def cleanup_stale_temps(input_path=None):
                 os.remove(path)
         except OSError:
             pass
+
+
+def cleanup_stale_temps(input_path=None):
+    """Drop leftovers from a previous killed / power-loss run.
+
+    Cleans:
+      - <input>_tmp_encode<ext> next to the movie;
+      - .ab-av1-* sample dirs next to the movie and in cwd
+        (ab-av1 default location when --temp-dir is not set);
+      - /tmp/mkv_audio_*, mkv_abrest_*, mkv_abav1_* from this tool.
+    """
+    if input_path:
+        abs_input = os.path.realpath(input_path)
+        base, ext = os.path.splitext(abs_input)
+        stale = base + "_tmp_encode" + ext
+        if os.path.isfile(stale):
+            try:
+                os.remove(stale)
+            except OSError as e:
+                eprint(f"Cannot remove stale temp file {stale}: {e}")
+                return False
+        _rm_abav1_dirs_in(os.path.dirname(abs_input))
+    try:
+        _rm_abav1_dirs_in(os.getcwd())
+    except OSError:
+        pass
+    _rm_prefixed_in_tmpdir()
     return True
+
+
+def ensure_abav1_temp():
+    """Create (once per run) a private --temp-dir for ab-av1 samples."""
+    global _ABAV1_TEMP
+    if _ABAV1_TEMP and os.path.isdir(_ABAV1_TEMP):
+        return _ABAV1_TEMP
+    _ABAV1_TEMP = tempfile.mkdtemp(prefix="mkv_abav1_")
+    _register_dir(_ABAV1_TEMP)
+    return _ABAV1_TEMP
+
+
+def _spawn(cmd, **kwargs):
+    """Popen in a new session so we can kill the whole process group."""
+    kwargs.setdefault("start_new_session", True)
+    return subprocess.Popen(cmd, **kwargs)
 
 
 def _on_signal(signum, frame):
@@ -540,16 +622,21 @@ def run_crf_search(path, min_vmaf):
     stderr is inherited so ab-av1 keeps its TTY progress bar. stdout is
     captured as NDJSON (--stdout-format json) to read the final CRF
     without stealing the terminal from the progress UI.
+
+    Samples go to a private --temp-dir we own and delete on abort / exit,
+    so a Ctrl+C never leaves .ab-av1-* junk next to the movie.
     """
     if not path or min_vmaf is None:
         return None
+    temp_dir = ensure_abav1_temp()
     cmd = ["ab-av1", "crf-search", "-i", path, "--preset", str(PRESET),
-           "--min-vmaf", str(min_vmaf), "--stdout-format", "json"]
+           "--min-vmaf", str(min_vmaf), "--stdout-format", "json",
+           "--temp-dir", temp_dir]
     try:
         # stderr=None → inherit the real terminal (progress bar).
         # Piping stderr makes ab-av1 fall back to INFO log lines.
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                             stderr=None, text=True, bufsize=1)
+        p = _spawn(cmd, stdout=subprocess.PIPE, stderr=None,
+                   text=True, bufsize=1)
     except FileNotFoundError:
         return None
     _CHILD_PROCS.append(p)
@@ -574,9 +661,13 @@ def run_crf_search(path, min_vmaf):
     except BaseException:
         # Never leave an orphan encoder burning CPU on abort.
         try:
-            p.kill()
-        except Exception:
-            pass
+            if p.pid:
+                os.killpg(p.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                p.kill()
+            except Exception:
+                pass
         raise
     finally:
         try:
@@ -789,7 +880,7 @@ def main():
             cmd += ["--enc", f"b:a:{idx}={br}k"]
 
     try:
-        p = subprocess.Popen(cmd)
+        p = _spawn(cmd)
     except FileNotFoundError:
         eprint("ab-av1 not found. Install ab-av1 and ffmpeg.")
         cleanup_generated()
@@ -799,9 +890,13 @@ def main():
         rc = p.wait()
     except BaseException:
         try:
-            p.kill()
-        except Exception:
-            pass
+            if p.pid:
+                os.killpg(p.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                p.kill()
+            except Exception:
+                pass
         cleanup_generated()
         raise
     finally:

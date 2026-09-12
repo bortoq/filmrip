@@ -60,9 +60,12 @@ in its place. If a `.bak` file is already there, it asks first.
 If the power fails in the middle of the file swap, the original is
 still safe in `film.mkv.bak` — just rename it back to `film.mkv`.
 
-Ctrl+C (or kill) removes temp encode files and search scratch dirs so
-the disk looks as it did before the run. Leftovers from a hard crash
-or power loss are removed automatically on the next start.
+Ctrl+C (or kill) stops ab-av1/ffmpeg and removes every temp this run
+created: the `_tmp_encode` output, `/tmp/mkv_*` scratch dirs, and the
+private ab-av1 `--temp-dir` (so no `.ab-av1-*` folders stay next to the
+movie). Leftovers from a hard crash or power loss — including stray
+`.ab-av1-*` dirs beside the file or in the current directory — are
+removed automatically on the next start.
 
 Run tests with:
 
