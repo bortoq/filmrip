@@ -147,37 +147,33 @@ will show the cleaner (denoised) picture.
 
 ## What we implemented so far
 
-- `--noise` with no argument -> mode `svt`: `film-grain=8`,
-  `film-grain-denoise=1` on both crf-search and encode.
-- `--noise hqdn3d[:N]` -> `--vfilter "hqdn3d=2:2:4:4"` plus
-  `film-grain=N`, `film-grain-denoise=0` (real denoise; ab-av1
-  scores VMAF against the filtered reference, so scores stay
-  honest). Verified live: crf-search runs clean with these flags.
-- `--noise atadenoise[:N]` -> `--vfilter "atadenoise"` plus
-  `film-grain=N`, `film-grain-denoise=0` (milder temporal denoise).
-- Cache key covers algo and level (`.noisesvt`, `.noisesvt12`,
-  `.noisehqdn3d8`, `.noiseatadenoise8`, ...) so CRF is not reused
-  across modes.
-- Bare `--noise` (no arguments) races `removegrain`,
+- `--noise` is a bare flag: it races `removegrain`,
   `fftdnoiz`/`fftdnoiz-strong`, `hqdn3d`/`hqdn3d-strong`,
   `atadenoise` on 3 short samples (fast preset-10 encode, raw vs
   filtered); filters over ~30s per sample are out. The winner is
   used (`off` under 5% removable grain); the grain level follows
-  the share (4/8/12). Shares, times and pick are printed; the
-  resolved mode keys the cache.
+  the share (4/8/12). The winning filter goes to `--vfilter` plus
+  `film-grain=N`, `film-grain-denoise=0` (real denoise; ab-av1
+  scores VMAF against the filtered reference, so scores stay
+  honest). Shares, times and pick are printed; the resolved
+  `algo:N` mode keys the main cache (`.noise{algo}{level}`), and
+  the verdict itself is remembered in `.noise.json`, so a repeat
+  run skips the race.
 - Approach A (SVT-internal denoise) retired: not tunable, and checks
-  kept finding visible grain left behind. `hqdn3d` / `atadenoise`
-  stay as explicit modes.
+  kept finding visible grain left behind. There are no per-filter
+  CLI modes: the race picks the filter.
 - `--crop` chains as `crop=w:h:x:y,<denoise filter>` in one
-  `--vfilter`: crop area (consensus of 3 cropdetect samples, else
-  off) has its own cache suffix and does not disturb the denoise
-  verdict.
+  `--vfilter`: crop area (rows/columns dark in ~90% of 24 gray
+  probe frames across 3 windows, else off) has its own cache suffix
+  and does not disturb the denoise verdict. cropdetect is not used:
+  its limit is not scaled to 10-bit sources, so bar noise counts as
+  content and it latches onto the widest flash frame.
 
 
 ## Open questions
 
-1. Should `mkvf` default `--noise` on, and `mkv` (animation) off?
-2. Auto grain level from a short sample vs fixed 8? (auto now picks the algo; level stays 8; needs calibration data.)
-3. ~~Add cheap ffmpeg modes~~ done as `--noise NAME`.
+1. Should the film profile default `--noise` on, and the animation profile off?
+2. Grain level calibration: auto picks 4/8/12 from the measured share; needs viewing data.
+3. ~~Add cheap ffmpeg modes~~ done as race candidates.
 4. How to adjust `--vmaf` policy when denoise is on?
 5. Do we ever want `film-grain-denoise=0` with external denoise only?

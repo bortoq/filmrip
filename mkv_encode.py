@@ -1,28 +1,32 @@
 #!/usr/bin/env python3
 """Smart movie compression to AV1 (video) + Opus (audio) at minimal bitrate.
 
-Use it through the mkv / mkvf wrappers in ~/bin:
-    mkvf film.mkv      # film:      --vmaf 94 --sdr 72
-    mkv  cartoon.mkv   # animation: --vmaf 90 --sdr 60
-
-Or call directly with subjective quality targets:
-    mkv_encode.py --vmaf 95 --sdr 90 film.mkv
+    python3 mkv_encode.py film.mkv                              # defaults
+    python3 mkv_encode.py --vmaf 90 --sdr 60 cartoon.mkv         # animation
+    python3 mkv_encode.py --vmaf 95 --sdr 90 --noise --crop film.mkv
 
 How it works:
-    audio: for each track, a 60-second sample from the middle of the film
-           is used to find the lowest Opus bitrate with SI-SDR >= target
-           (--sdr 0..100 maps linearly to 0..25 dB; see README table);
+    audio: for each track, 30 short places (5 seconds each) are
+           ranked by difficulty at the middle bitrate, the ladder is
+           bisected on the 3 hardest places (10-second samples), the
+           exact need is secant-refined and verified, and the median
+           need wins (--sdr 0..100 maps linearly to 0..25 dB SI-SDR;
+           see README table);
     video: ab-av1 crf-search finds the highest CRF with VMAF >= --vmaf,
-           then ab-av1 encode compresses the whole file.
+           then ab-av1 encode compresses the whole file;
+    options: --noise races denoise filters and keeps an AV1 grain
+           model; --crop cuts black bars; both verdicts are cached.
 
     A stream that cannot hit its target with a smaller size is copied
     as is. When nothing can be compressed (the video and every audio
     track end up copied), the script says so and exits without
-    touching the file.
+    touching the file (exit 1, see README).
 
-Screen output is kept minimal: one updating audio-search line per track
-(ab-av1 style) that becomes the result line `- vbr 48 SI-SDR 32 (20%)`,
-then the normal ab-av1 crf-search / encode progress.
+Screen output is kept minimal: one updating bar per slow step
+(ab-av1 shape) that becomes a result line such as
+`- sound 1: vbr 48 SI-SDR 32 (20%)`, then the ab-av1 bars.
+Slow searches (CRF, audio plan, noise/crop verdicts) are cached in
+/tmp (see README ## Cache).
 """
 
 import argparse
@@ -40,7 +44,7 @@ import threading
 import time
 
 PRESET = 3
-SAMPLE_SECS = 60  # audio sample length for bitrate search, in seconds
+SAMPLE_SECS = 60  # cap for the source-bitrate guess window, in seconds
 CACHE_DIR = "/tmp"
 
 # --noise NAME: grain handling (doc/research.md).
@@ -184,17 +188,20 @@ SISDR_AT_100 = 25.0
 # seconds at the ladder middle to order them by difficulty (lower
 # SI-SDR first; failed probes count as hardest). Stage 2 bisects the
 # bitrate ladder on the REFINE_TOP hardest places (REFINE_SECS samples
-# centered on the same spots) with at most BISECT_PROBES probes plus
-# one neighbor check, and takes the highest need. Scores rise smoothly
-# with bitrate (measured: 0.2% dips), so bisection is safe.
+# centered on the same spots): bisection (at most BISECT_PROBES
+# probes), a walk down to the true first hitting rung (WALK_PROBES),
+# then secant steps on the measured bracket (SECANT_PROBES). Every
+# returned bitrate is verified on its place, never a raw ladder rung.
+# Scores rise smoothly with bitrate (measured: 0.2% dips), so
+# bisection and the secant line are safe.
 RANK_POSITIONS = 30
 RANK_SECS = 5.0
 REFINE_TOP = 3
 REFINE_SECS = 10.0
 BISECT_PROBES = 6
-# One neighbor check plus one interpolated exact-bitrate verify per
-# refined place on top of the bisection probes.
-REFINE_PROBES = BISECT_PROBES + 2
+WALK_PROBES = 3
+SECANT_PROBES = 3
+REFINE_PROBES = BISECT_PROBES + WALK_PROBES + SECANT_PROBES
 # ...a pick must save a real chunk of the source track, otherwise the
 # source is copied (no pointless re-encode of near-source sizes).
 SAT_MIN_SAVING = 0.75
@@ -455,7 +462,9 @@ def cleanup_stale_temps(input_path=None):
         abs_input = os.path.realpath(input_path)
         base, ext = os.path.splitext(abs_input)
         stale = base + "_tmp_encode" + ext
-        if os.path.isfile(stale):
+        # Age-guarded like every other path: a parallel run of the
+        # same file owns a fresh output, never touch it.
+        if os.path.isfile(stale) and _is_stale(stale):
             try:
                 os.remove(stale)
             except OSError as e:
@@ -562,62 +571,154 @@ def video_size(path):
     return w, h
 
 
-def parse_cropdetect_line(line):
-    """(w, h, x, y) from one cropdetect line; None when absent."""
-    if not line or not isinstance(line, str):
-        return None
-    try:
-        m = re.search(r"crop=(\d+):(\d+):(\d+):(\d+)", line)
-    except (ValueError, TypeError):
-        return None
-    if not m:
-        return None
-    try:
-        w, h, x, y = (int(m.group(i)) for i in (1, 2, 3, 4))
-    except (ValueError, TypeError):
-        return None
-    if w <= 0 or h <= 0 or x < 0 or y < 0:
-        return None
-    return w, h, x, y
-
-
-def pick_crop(counts, src_w, src_h):
-    """Most-voted crop area "w:h:x:y"; None when unclear or unsafe.
-
-    Ties go to the smaller area. Rejects areas outside the source
-    frame and cuts below 40% of the source area. Never raises.
-    """
-    try:
-        if not counts or not src_w or not src_h:
-            return None
-        top = max(counts.values())
-        if top < 2:
-            return None
-        cands = sorted([a for a, n in counts.items() if n == top],
-                       key=lambda a: a[0] * a[1])
-        for w, h, x, y in cands:
-            if w % 2 or h % 2:
-                continue
-            if x + w > src_w or y + h > src_h:
-                continue
-            if w * h < 0.4 * src_w * src_h:
-                continue
-            return f"{w}:{h}:{x}:{y}"
-    except (ValueError, TypeError, AttributeError):
-        pass
-    return None
-
-
 CROP_SECS = 30.0
 CROP_FRACS = (0.15, 0.5, 0.85)
+CROP_FRAMES = 8
+CROP_PROBE_W = 480
+CROP_PROBE_H = 270
+CROP_LIMIT = 24
+CROP_AGREE = 0.9
+CROP_MIN_BAR = 8
+CROP_MIN_AREA = 0.4
+
+
+def grab_gray_frame(path, pos):
+    """One small 8-bit gray frame at pos seconds; None on failure.
+
+    The frame is scaled with nearest-neighbor so dark bars stay dark
+    and bright dots survive. Never raises, never writes near the film.
+    """
+    try:
+        if not path or not os.path.isfile(path):
+            return None
+        pos = float(pos)
+        if pos < 0:
+            return None
+    except (ValueError, TypeError):
+        return None
+    want = CROP_PROBE_W * CROP_PROBE_H
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-ss", f"{pos:.1f}",
+             "-i", path, "-frames:v", "1",
+             "-vf", (f"scale={CROP_PROBE_W}:{CROP_PROBE_H}:"
+                     "flags=neighbor,format=gray"),
+             "-f", "rawvideo", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except (OSError, ValueError):
+        return None
+    try:
+        if r.returncode != 0:
+            return None
+        data = bytes(r.stdout or b"")
+    except (ValueError, TypeError):
+        return None
+    if len(data) != want:
+        return None
+    return data
+
+
+def dark_borders(pixels, pw, ph, limit=CROP_LIMIT):
+    """(dark_rows, dark_cols): True where the row/col is all under limit.
+
+    Guards sizes and types; never raises.
+    """
+    try:
+        lim = int(limit)
+        w = int(pw)
+        h = int(ph)
+        data = bytes(pixels or b"")
+    except (ValueError, TypeError):
+        return [], []
+    if w <= 0 or h <= 0 or len(data) != w * h:
+        return [], []
+    try:
+        rows = [max(data[y * w:(y + 1) * w]) < lim for y in range(h)]
+        cols = [max(data[x::w]) < lim for x in range(w)]
+    except (ValueError, TypeError):
+        return [], []
+    return rows, cols
+
+
+def pick_crop(row_votes, col_votes, nframes, src_w, src_h):
+    """Bar area "w:h:x:y" from dark-row/col votes; None when unclear.
+
+    A border row/col counts as a bar when dark in CROP_AGREE of the
+    frames, so one bright flash cannot widen the area. Bars under
+    CROP_MIN_BAR source pixels are ignored, areas under CROP_MIN_AREA
+    of the frame are rejected. Never raises.
+    """
+    try:
+        n = int(nframes)
+        sw = int(src_w)
+        sh = int(src_h)
+        rows = [int(v) for v in (row_votes or [])]
+        cols = [int(v) for v in (col_votes or [])]
+    except (ValueError, TypeError):
+        return None
+    ph, pw = len(rows), len(cols)
+    if n <= 0 or sw <= 0 or sh <= 0 or ph <= 0 or pw <= 0:
+        return None
+    try:
+        need = math.ceil(CROP_AGREE * n)
+        top = bottom = left = right = 0
+        for v in rows:
+            if v >= need:
+                top += 1
+            else:
+                break
+        for v in reversed(rows):
+            if v >= need:
+                bottom += 1
+            else:
+                break
+        for v in cols:
+            if v >= need:
+                left += 1
+            else:
+                break
+        for v in reversed(cols):
+            if v >= need:
+                right += 1
+            else:
+                break
+    except (ValueError, TypeError):
+        return None
+    if top + bottom >= ph or left + right >= pw:
+        return None
+    try:
+        y0 = int(top * sh / ph)
+        y1 = int(sh - bottom * sh / ph)
+        x0 = int(left * sw / pw)
+        x1 = int(sw - right * sw / pw)
+    except (ValueError, TypeError, ZeroDivisionError):
+        return None
+    # even offsets and sizes for yuv420
+    x0 -= x0 % 2
+    y0 -= y0 % 2
+    w = x1 - x0
+    h = y1 - y0
+    w -= w % 2
+    h -= h % 2
+    if w <= 0 or h <= 0 or x0 < 0 or y0 < 0:
+        return None
+    if x0 + w > sw or y0 + h > sh:
+        return None
+    bars = (y0, sh - (y0 + h), x0, sw - (x0 + w))
+    if max(bars) < CROP_MIN_BAR:
+        return None
+    if w * h < CROP_MIN_AREA * sw * sh:
+        return None
+    return f"{w}:{h}:{x0}:{y0}"
 
 
 def detect_crop(path, duration, progress=None):
-    """Black-bar area "w:h:x:y" from samples; None when none found.
+    """Black-bar area "w:h:x:y" from probe frames; None when none found.
 
-    Runs cropdetect on a few short read-only samples and takes the
-    consensus area. progress, if given, is started at once and told
-    each sample. Never raises, never writes near the film.
+    Grabs small 8-bit gray frames in three windows across the film and
+    cuts rows/columns dark in nearly every frame. progress, if given,
+    is started at once and told each frame. Never raises, never writes
+    near the film.
     """
     def _show(text=None, done=False, step=False):
         if progress is None:
@@ -641,29 +742,43 @@ def detect_crop(path, duration, progress=None):
     if src_w is None:
         return None
     _show()
-    counts = {}
+    row_votes = [0] * CROP_PROBE_H
+    col_votes = [0] * CROP_PROBE_W
+    n = 0
     try:
         fracs = list(CROP_FRACS)
-        for fi, frac in enumerate(fracs):
-            _show(f"crop {fi + 1}/{len(fracs)}")
+        total = len(fracs) * CROP_FRAMES
+        for frac in fracs:
             win = min(float(CROP_SECS), max(5.0, duration))
             last = max(0.0, duration - win)
-            start = round(min(last, max(0.0, frac * duration - win / 2)), 1)
-            r = run_quiet(["ffmpeg", "-y", "-v", "info",
-                           "-ss", f"{start:.1f}", "-i", path,
-                           "-t", f"{win:.1f}",
-                           "-vf", "cropdetect=24:16:0",
-                           "-an", "-f", "null", "-"])
-            _show(step=True)
-            for line in (r.stderr or "").splitlines():
-                area = parse_cropdetect_line(line)
-                if area is not None:
-                    counts[area] = counts.get(area, 0) + 1
+            try:
+                start = min(last, max(0.0, float(frac) * duration
+                                     - win / 2))
+            except (ValueError, TypeError):
+                continue
+            for k in range(CROP_FRAMES):
+                _show(f"crop {n + 1}/{total}")
+                frame = grab_gray_frame(
+                    path, start + (k + 0.5) * win / CROP_FRAMES)
+                _show(step=True)
+                if frame is None:
+                    continue
+                rows, cols = dark_borders(frame, CROP_PROBE_W,
+                                          CROP_PROBE_H)
+                if not rows or not cols:
+                    continue
+                n += 1
+                for i, dark in enumerate(rows):
+                    row_votes[i] += 1 if dark else 0
+                for i, dark in enumerate(cols):
+                    col_votes[i] += 1 if dark else 0
     except Exception:
         return None
     finally:
         _show(done=True)
-    return pick_crop(counts, src_w, src_h)
+    if n <= 0:
+        return None
+    return pick_crop(row_votes, col_votes, n, src_w, src_h)
 
 
 def bitrate_bounds(track):
@@ -686,7 +801,8 @@ def estimate_src_bitrate(path, aindex, start, dur):
 
     ffprobe often reports audio bitrate in MKV as N/A. Without a guess,
     the search would use the full range and could "upscale" a lossy source.
-    A fast stream-copy of the 60-second sample gives a fair guess.
+    A fast stream-copy of a short sample (up to SAMPLE_SECS) gives
+    a fair guess.
     Returns None if the guess fails.
     """
     if not path or dur is None or dur <= 0:
@@ -854,11 +970,6 @@ def _use_color():
     if os.environ.get("TERM") == "dumb":
         return False
     return True
-
-
-def _stderr_use_color():
-    """Old name for _use_color; kept for compatibility."""
-    return _use_color()
 
 
 def _paint(text, code):
@@ -1522,9 +1633,9 @@ def format_grain_result(mode, share):
     if not vf:
         return "- off"
     algo = denoise_algo(mode)
-    params = vf.split("=", 1)[1] if "=" in vf else ""
+    name, _, params = vf.partition("=")
     if algo:
-        disp = f"{algo}, {params.replace('=', ' ')}" if params else algo
+        disp = f"{algo}, {params}" if params else algo
     else:
         disp = vf
     if share is None:
@@ -1568,10 +1679,13 @@ def pick_audio_bitrate(path, track, target_db, duration, progress=None):
 
     Returns (bitrate_kbit, method, sisdr_db|None, size_pct|None) —
     the same order the audio plan is cached in. method is:
-    search — the lowest sampled Opus bitrate that hit the target;
-    copy — the track is kept as is (already opus, target out of reach,
-    or measuring failed). size_pct is the chosen track size vs the
-    original (100 for copy, None when the source bitrate is unknown).
+    search — an exact bitrate (any integer kbit/s, not a ladder rung)
+    verified to hit the target on its hard place; copy — the track is
+    kept as is (already opus, target out of reach, or measuring
+    failed). size_pct is the chosen track size vs the original (100
+    for copy, None when the source bitrate is unknown). A hard place
+    that cannot hit the target even at the ladder top is left out of
+    the median with a warning on stderr.
     """
     ch = track.get("channels") or 0
     codec = track.get("codec") or ""
@@ -1767,37 +1881,48 @@ def pick_audio_bitrate(path, track, target_db, duration, progress=None):
                     ans, hi_idx = mid, mid - 1
                 else:
                     lo = mid + 1
-            if ans is not None and ans > 0 and (ans - 1) not in measured:
-                s = ask(ans - 1)  # neighbor check: confirm first hit
+            if ans is None:
+                dbg(f"track a{ai}: place {ji}: target out of reach "
+                    f"(top {cands[-1]}k) -- left out of the median")
+                eprint(f"Note: track a{ai} place {ji + 1}: even "
+                       f"{cands[-1]}k misses the target -- sizing for "
+                       f"the easier hard places.")
+                continue
+            # Walk down to the true first hitting rung: bisection may
+            # stop above it when the probe budget runs out.
+            for _ in range(WALK_PROBES):
+                if ans <= 0:
+                    break
+                s = ask(ans - 1)
                 if s is not None and s >= target_db:
                     ans -= 1
-            if ans is not None:
-                # Exact bitrate between the bracketing ladder points.
-                los = [i for i in measured
-                       if i < ans and measured[i] is not None
-                       and measured[i] < target_db]
-                if los:
-                    lo_idx = max(los)
-                    cand = interp_br(cands[lo_idx], measured[lo_idx],
-                                     cands[ans], measured[ans], target_db)
-                else:
-                    cand = None
-                if cand is not None:
-                    s = probe_at(ref, active, cand, f"v{ji}")
+                    continue
+                break
+            hi_br, hi_s = cands[ans], measured[ans]
+            los = [i for i in measured
+                   if i < ans and measured[i] is not None
+                   and measured[i] < target_db]
+            if los:
+                # Secant steps on the measured bracket: hi stays a
+                # verified hit, so the result never undershoots.
+                lo_br = cands[max(los)]
+                lo_s = measured[max(los)]
+                for step in range(SECANT_PROBES):
+                    cand = interp_br(lo_br, lo_s, hi_br, hi_s,
+                                     target_db)
+                    if cand is None or cand >= hi_br or cand <= lo_br:
+                        break
+                    s = probe_at(ref, active, cand, f"v{ji}_{step}")
                     tick(bitrate_k=cand, score=s)
-                    if s is not None and s >= target_db:
-                        needs.append((cand, s))
-                        dbg(f"track a{ai}: place {ji}: need {cand}k "
-                            f"(SI-SDR {s:.1f} dB, exact)")
+                    if s is None:
+                        break
+                    if s >= target_db:
+                        hi_br, hi_s = cand, s
                     else:
-                        needs.append((cands[ans], measured[ans]))
-                        dbg(f"track a{ai}: place {ji}: need "
-                            f"{cands[ans]}k "
-                            f"(SI-SDR {measured[ans]:.1f} dB)")
-                else:
-                    needs.append((cands[ans], measured[ans]))
-                    dbg(f"track a{ai}: place {ji}: need {cands[ans]}k "
-                        f"(SI-SDR {measured[ans]:.1f} dB)")
+                        lo_br, lo_s = cand, s
+            needs.append((hi_br, hi_s))
+            dbg(f"track a{ai}: place {ji}: need {hi_br}k "
+                f"(SI-SDR {hi_s:.1f} dB, exact)")
         if not needs:
             dbg(f"track a{ai}: target out of reach -- copying track")
             tick(bitrate_k=cands[-1], consume=steps_left)
@@ -1841,10 +1966,12 @@ def format_audio_result(br, method, score, pct, aindex=None):
     (0..100); pct -- new audio size vs the original track, that is
     100 * new size / old size like ab-av1 (100 for copy); aindex --
     zero-based track index, shown one-based, so every line says which
-    stream it belongs to. Missing parts are skipped.
+    stream it belongs to; None for a lone track ("- sound: ...").
+    Missing parts are skipped.
     """
     try:
-        tag = f"- sound {int(aindex) + 1}: " if aindex is not None else "- "
+        tag = (f"- sound {int(aindex) + 1}: " if aindex is not None
+               else "- sound: ")
     except (ValueError, TypeError):
         tag = "- "
     if method == "copy":
@@ -1859,19 +1986,63 @@ def format_audio_result(br, method, score, pct, aindex=None):
     return " ".join(parts)
 
 
-def _track_steps(track):
-    """Progress-bar step count: rank probes + refine bisections."""
+def _track_steps():
+    """Progress-bar step count: rank probes + refine probes."""
     return RANK_POSITIONS + REFINE_TOP * REFINE_PROBES
 
 
-def run_crf_search(path, min_vmaf, noise=False, svt_args=None,
-                   vfilter=None):
+def abav1_hint_text(path, crf, svt_args=None, vfilter=None):
+    """Rebuild ab-av1's trailing `Encode with:` line for its length.
+
+    Only the visible length matters (to clear wrapped rows too);
+    the exact quoting is best-effort. Never raises.
+    """
+    try:
+        parts = ["Encode with: ab-av1 encode -i", str(path),
+                 "--crf", str(crf), "--preset", str(PRESET)]
+        if isinstance(vfilter, str) and vfilter.strip():
+            parts += ["--vfilter", f'"{vfilter.strip()}"']
+        for _a in (svt_args or []):
+            if isinstance(_a, str) and _a.strip():
+                parts += ["--svt", _a.strip()]
+        return " ".join(parts)
+    except Exception:
+        return ""
+
+
+def clear_abav1_hint(path, crf, svt_args=None, vfilter=None):
+    """Erase ab-av1's trailing `Encode with:` line from a real tty.
+
+    ab-av1 always prints it after a successful search, between our
+    bars. Only runs on a color tty (never pipes, files, dumb
+    terminals); a wrong row guess at worst leaves today's one stale
+    line. Never raises.
+    """
+    try:
+        if not _use_color():
+            return
+        width = shutil.get_terminal_size().columns
+        if not width or width < 40:
+            width = 80
+    except Exception:
+        return
+    try:
+        text = abav1_hint_text(path, crf, svt_args, vfilter)
+        if not text:
+            return
+        rows = max(1, (len(text) + width - 1) // width)
+        sys.stderr.write(f"\x1b[{rows}A\x1b[J")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def run_crf_search(path, min_vmaf, svt_args=None, vfilter=None):
     """ab-av1 crf-search; returns (crf, samples, no_good_crf).
 
     svt_args is a list of SVT key=value pairs (see
     svt_args_for_denoise()); vfilter is one ffmpeg filter string (see
-    vfilter_for_denoise()); noise=True is a deprecated alias for the
-    default denoise mode. The same denoise must score the samples and
+    vfilter_for_denoise()). The same denoise must score the samples and
     the final encode, so the found CRF fits what is encoded.
 
     crf is None on failure. samples collects the (vmaf, percent) pair of
@@ -1880,12 +2051,13 @@ def run_crf_search(path, min_vmaf, noise=False, svt_args=None,
     "Failed to find a suitable crf" (the quality target needs more than
     --max-encoded-percent, 80% of the source) rather than crashing.
 
-    stderr is always inherited, so ab-av1 draws on the real screen
-    itself: full width, own colors, nothing is intercepted or redrawn.
-    stdout is captured as NDJSON (--stdout-format json) to read the
-    final CRF without stealing the terminal from the progress UI.
-    The `Encode with:` hint ab-av1 prints at the end stays on screen;
-    totals are printed after it as plain lines.
+    stderr is inherited (except in --debug, where it is piped and
+    drained), so ab-av1 draws on the real screen itself: full width,
+    own colors, nothing is intercepted or redrawn. stdout is captured
+    as NDJSON (--stdout-format json) to read the final CRF without
+    stealing the terminal from the progress UI. The `Encode with:`
+    hint ab-av1 prints after a successful search is erased from a
+    real tty, so no stale line stays between our bars.
 
     Samples go to a private --temp-dir we own and delete on abort / exit,
     so a Ctrl+C never leaves .ab-av1-* junk next to the movie.
@@ -1897,8 +2069,6 @@ def run_crf_search(path, min_vmaf, noise=False, svt_args=None,
            "--min-vmaf", str(min_vmaf), "--stdout-format", "json",
            "--temp-dir", temp_dir]
     eff_svt = list(svt_args) if svt_args else []
-    if not eff_svt and noise:
-        eff_svt = svt_args_for_denoise("hqdn3d")
     for _a in eff_svt:
         if not isinstance(_a, str) or "=" not in _a:
             continue
@@ -1991,6 +2161,9 @@ def run_crf_search(path, min_vmaf, noise=False, svt_args=None,
             _CHILD_PROCS.remove(p)
     if p.returncode != 0:
         return None, samples, no_good
+    if found is not None and not DEBUG:
+        clear_abav1_hint(path, found, eff_svt,
+                         vfilter if isinstance(vfilter, str) else None)
     return found, samples, no_good
 
 
@@ -2053,6 +2226,118 @@ def load_cache(cache_path):
         return None, None, None
 
 
+def noise_cache_path(filename, filesize):
+    """Verdict-cache file for the --noise race; "" when unusable."""
+    try:
+        if not filename or filesize is None:
+            return ""
+        return os.path.join(CACHE_DIR,
+                            f"{filename}.{int(filesize)}b.noise.json")
+    except (ValueError, TypeError):
+        return ""
+
+
+def load_noise_verdict(cache_path):
+    """Read {"mode", "share"} of a --noise race; None when bad.
+
+    mode is a resolved denoise mode ("algo:N"); None mode means the
+    race decided the grain is not worth removing. /tmp is
+    world-writable: the file is validated so a broken or planted one
+    cannot crash us or smuggle in a bad filter.
+    """
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            cached = json.load(f)
+        if not isinstance(cached, dict):
+            raise ValueError("bad verdict file")
+        mode = cached.get("mode")
+        if mode is not None:
+            if not isinstance(mode, str) or not mode.strip():
+                raise ValueError("bad verdict mode")
+            if denoise_algo(mode) not in FILTER_CANDIDATES:
+                raise ValueError("bad verdict mode")
+        share = cached.get("share")
+        if share is not None and (isinstance(share, bool)
+                                  or not isinstance(share, (int, float))
+                                  or not math.isfinite(share)):
+            raise ValueError("bad verdict share")
+        return {"mode": mode, "share": share}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def save_noise_verdict(cache_path, mode, share):
+    """Remember a --noise race verdict; silently skip on failure."""
+    if not cache_path:
+        return
+    try:
+        payload = {"mode": mode,
+                   "share": (None if share is None
+                             else round(float(share), 3))}
+    except (ValueError, TypeError):
+        return
+    try:
+        with open(cache_path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(cache_path + ".tmp", cache_path)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def crop_cache_path(filename, filesize):
+    """Verdict-cache file for the --crop probe; "" when unusable."""
+    try:
+        if not filename or filesize is None:
+            return ""
+        return os.path.join(CACHE_DIR,
+                            f"{filename}.{int(filesize)}b.crop.json")
+    except (ValueError, TypeError):
+        return ""
+
+
+def load_crop_verdict(cache_path):
+    """Read {"area"} of a --crop probe; None when bad.
+
+    area is a "w:h:x:y" bar area; None area means the probe found no
+    bars worth cutting. Validated like every /tmp file. Never raises.
+    """
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            cached = json.load(f)
+        if not isinstance(cached, dict):
+            raise ValueError("bad verdict file")
+        area = cached.get("area")
+        if area is not None:
+            if not isinstance(area, str):
+                raise ValueError("bad verdict area")
+            parts = area.strip().split(":")
+            if len(parts) != 4:
+                raise ValueError("bad verdict area")
+            w, h, x, y = (int(v) for v in parts)
+            if w <= 0 or h <= 0 or x < 0 or y < 0:
+                raise ValueError("bad verdict area")
+            area = f"{w}:{h}:{x}:{y}"
+        return {"area": area}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def save_crop_verdict(cache_path, area):
+    """Remember a --crop probe verdict; silently skip on failure."""
+    if not cache_path:
+        return
+    try:
+        payload = {"area": (None if area is None else str(area))}
+    except (ValueError, TypeError):
+        return
+    try:
+        with open(cache_path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(cache_path + ".tmp", cache_path)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
 def make_cache_id(filename, filesize, min_vmaf, sdr, noise=False,
                   denoise=None, crop=None):
     """Cache key: file identity + quality targets (+ denoise mode).
@@ -2061,9 +2346,8 @@ def make_cache_id(filename, filesize, min_vmaf, sdr, noise=False,
     not reused across filters or picture sizes, a filtered encode
     needs its own search. Keys without them stay exactly as before,
     so old caches load. denoise is a parsed mode ("algo", "algo:N"
-    or None); noise=True is a deprecated alias for the hqdn3d
-    default; crop is a "w:h:x:y" area. Suffix forms:
-    ".noise{algo}{level}", ".crop{W}x{H}".
+    or None); crop is a "w:h:x:y" area. Suffix forms:
+    ".noise{algo}{level}", ".crop{W}x{H}+{x}+{y}".
     """
     if not filename or filesize is None:
         return ""
@@ -2081,8 +2365,8 @@ def make_cache_id(filename, filesize, min_vmaf, sdr, noise=False,
             cid += f".noise{algo}{level}"
     if isinstance(crop, str) and crop.strip():
         try:
-            w, h = crop.strip().split(":")[:2]
-            cid += f".crop{int(w)}x{int(h)}"
+            w, h, x, y = (int(v) for v in crop.strip().split(":")[:4])
+            cid += f".crop{w}x{h}+{x}+{y}"
         except (ValueError, TypeError, IndexError):
             pass
     return cid
@@ -2205,35 +2489,70 @@ def main():
     if not cleanup_stale_temps(abs_input):
         return 1
 
+    # Overwrite checkpoint before any slow probe: answering "n" must
+    # not cost minutes of grain/crop/audio search first.
+    bak_file = abs_input + ".bak"
+    if os.path.exists(bak_file):
+        try:
+            ans = input(f"Backup file already exists: {bak_file}\n"
+                        f"Overwrite the existing .bak with the new original? "
+                        f"[y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return 1
+        if ans not in ("y", "yes"):
+            return 1
+
     if denoise_mode == "auto":
         # Bare --noise: probe the source first, then pick the filter.
-        # The resolved mode (never "auto") keys the cache below.
+        # The resolved mode (never "auto") keys the cache below; the
+        # verdict itself is remembered by file identity, so a repeat
+        # run skips the slow race.
         duration, tracks = probe(abs_input)
-        spin = None
-        if not DEBUG:
-            total = (len(AUTO_PROBE_FRACS) * (1 + len(FILTER_CANDIDATES))
-                     + len(FILTER_CANDIDATES))
-            spin = _Spinner("probe", total=total)
-        scores, ftimes = measure_grain(abs_input, duration,
-                                       progress=spin)
-        denoise_mode = auto_pick_mode(scores, ftimes)
+        verdict_path = noise_cache_path(filename, filesize)
+        verdict = (load_noise_verdict(verdict_path) if verdict_path
+                   else None)
+        if verdict is None:
+            spin = None
+            if not DEBUG:
+                total = (len(AUTO_PROBE_FRACS)
+                         * (1 + len(FILTER_CANDIDATES))
+                         + len(FILTER_CANDIDATES))
+                spin = _Spinner("probe", total=total)
+            scores, ftimes = measure_grain(abs_input, duration,
+                                           progress=spin)
+            denoise_mode = auto_pick_mode(scores, ftimes)
+            algo = denoise_algo(denoise_mode)
+            share = scores.get(algo) if algo else None
+            save_noise_verdict(verdict_path, denoise_mode, share)
+        else:
+            denoise_mode, share = verdict["mode"], verdict.get("share")
+            dbg(f"noise verdict cached: {denoise_mode} ({share})")
         try:
             denoise_svt = svt_args_for_denoise(denoise_mode)
             denoise_vf = vfilter_for_denoise(denoise_mode)
         except ValueError:
             denoise_mode, denoise_svt, denoise_vf = None, [], None
         algo = denoise_algo(denoise_mode)
-        share = scores.get(algo) if algo else None
         eprint(format_grain_result(denoise_mode, share))
 
-    if args.crop and (duration is None or tracks is None):
+    if ((denoise_mode == "auto" or args.crop)
+            and (duration is None or tracks is None)):
         duration, tracks = probe(abs_input)
     crop_area = None
     if args.crop:
-        cspin = None
-        if not DEBUG:
-            cspin = _Spinner("crop", total=len(CROP_FRACS))
-        crop_area = detect_crop(abs_input, duration, progress=cspin)
+        verdict_path = crop_cache_path(filename, filesize)
+        verdict = (load_crop_verdict(verdict_path) if verdict_path
+                   else None)
+        if verdict is None:
+            cspin = None
+            if not DEBUG:
+                cspin = _Spinner("crop",
+                                 total=len(CROP_FRACS) * CROP_FRAMES)
+            crop_area = detect_crop(abs_input, duration, progress=cspin)
+            save_crop_verdict(verdict_path, crop_area)
+        else:
+            crop_area = verdict.get("area")
+            dbg(f"crop verdict cached: {crop_area}")
         eprint(f"- crop {crop_area}" if crop_area else "- crop off")
     crop_vf = f"crop={crop_area}" if crop_area else None
     video_vf = ",".join(v for v in (crop_vf, denoise_vf) if v) or None
@@ -2262,17 +2581,6 @@ def main():
 
     base, ext = os.path.splitext(abs_input)
     tmp_output = base + "_tmp_encode" + ext
-    bak_file = abs_input + ".bak"
-
-    if os.path.exists(bak_file):
-        try:
-            ans = input(f"Backup file already exists: {bak_file}\n"
-                        f"Overwrite the existing .bak with the new original? "
-                        f"[y/N]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return 1
-        if ans not in ("y", "yes"):
-            return 1
 
     # --- cache ---
     crf, audio_plan, cached_video = None, None, None
@@ -2302,7 +2610,7 @@ def main():
         audio_plan = []
         for t in tracks:
             progress = (None if DEBUG
-                          else _AudioProgress(_track_steps(t),
+                          else _AudioProgress(_track_steps(),
                                              aindex=t.get("aindex")))
             if progress is not None:
                 progress.start()
@@ -2310,13 +2618,14 @@ def main():
                 br, method, score, pct = pick_audio_bitrate(
                     abs_input, t, min_sisdr, duration, progress=progress)
                 # the updating search line becomes the result line
+                tag_idx = t.get("aindex") if len(tracks) > 1 else None
                 if progress:
                     progress.finish(
                         format_audio_result(br, method, score, pct,
-                                            t.get("aindex")))
+                                            tag_idx))
                 else:
                     eprint(format_audio_result(br, method, score, pct,
-                                               t.get("aindex")))
+                                               tag_idx))
             except BaseException:
                 if progress:
                     progress.finish()
@@ -2332,13 +2641,15 @@ def main():
     elif tracks:
         # cached plan: show the same result lines without re-searching
         for t, entry in zip(tracks, audio_plan):
-            eprint(format_audio_result(*entry, t.get("aindex")))
+            tag_idx = t.get("aindex") if len(tracks) > 1 else None
+            eprint(format_audio_result(*entry, tag_idx))
 
     # --- 2. video: CRF (or keep the video stream as is) ---
     if not video_copy:
         # a CRF found without denoise does not fit a grain-synthesis
-        # encode, and the other way round (level matters too)
-        if crf is None and denoise_mode is None:
+        # encode, and the other way round (level matters too); a CRF
+        # found on other pixels (crop) does not fit either
+        if crf is None and denoise_mode is None and crop_area is None:
             if os.path.isfile(legacy_crf):
                 try:
                     with open(legacy_crf, encoding="utf-8") as f:
@@ -2400,7 +2711,7 @@ def main():
             os.replace(cache_path + ".tmp", cache_path)
         except OSError:
             pass
-        if crf is not None and denoise_mode is None:
+        if crf is not None and denoise_mode is None and crop_area is None:
             try:
                 with open(legacy_crf, "w", encoding="utf-8") as f:
                     f.write(str(crf))

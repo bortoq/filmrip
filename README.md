@@ -20,8 +20,8 @@ cd filmrip
 - `ffmpeg` + `ffprobe` — audio search, filters, muxing.
   Install: https://ffmpeg.org/download.html
   (static builds include everything below).
-  Needs the `libopus` and `libsvtav1` encoders plus the `asisdr`,
-  `astats`, `cropdetect` filters. Tested: 8.1.
+  Needs the `libopus` and `libsvtav1` encoders plus the `asisdr`
+  and `astats` filters. Tested: 8.1.
   Check: `ffmpeg -hide_banner -h encoder=libopus`,
   `ffmpeg -hide_banner -h filter=asisdr`.
 - `python3` (standard library only, no packages).
@@ -55,8 +55,9 @@ mkv_encode.py --crop film.mkv    # cut black bars first
   used (`off` under 5% removable grain); the grain model level (4/8/12)
   follows the measured share. Every mode stores an AV1 grain model,
   so the decoder paints grain back.  Leave it off for animation.
-- `--crop` — detect black bars on 3 samples and cut the consensus
-  picture area (`- crop 1920:800:0:140`, `- crop off` when unclear).
+- `--crop` — probe gray frames in 3 windows and cut rows/columns
+  dark in nearly every frame (`- crop 1920:800:0:140`, `- crop off`
+  when unclear). One bright flash cannot widen the area.
   Same crop goes to `crf-search` and `encode`, with its own cache
   key; chains with `--noise` into one filter.
 
@@ -115,8 +116,40 @@ To save every byte:
 - silent channels (LFE pauses and such) do not count in the score;
 - 6-channel tracks with the `5.1(side)` layout are fixed to plain `5.1`.
 
-Search results (CRF + audio bitrates) are cached in `/tmp`, keyed by
-file name, size, and quality targets.
+## Cache
+
+Everything slow is remembered in `/tmp`, so a repeat run only
+encodes. Identity is the file name plus size (targets are part of
+the key where they matter):
+
+- `NAME.SIZEb.vmafV.sdrS[.noiseALGOlvl][.cropWxH+X+Y].json` — the
+  CRF plus the per-track audio plan `(bitrate, method, SI-SDR,
+  pct)`. Denoise and crop runs each get their own key (crop offsets
+  included): a CRF found for one filter or picture area is never
+  reused for another.
+- `NAME.SIZEb.noise.json` — the `--noise` race verdict (winning
+  filter and grain share), keyed by file alone: it depends only on
+  the source, not on targets.
+- `NAME.SIZEb.crop.json` — the `--crop` probe verdict (bar area or
+  none), keyed by file alone for the same reason.
+- Legacy `NAME.SIZEb.vmafV.sdrS.json` and `NAME.SIZEb.vmafV.crf`
+  from older runs still load (plain runs only: denoise/crop runs
+  never touch them, so one mode cannot poison another).
+- A genuine miss ("no CRF fits in 80% of the source") is remembered;
+  a crashed search is not — the next run searches again.
+- Leftovers of a killed run (`*_tmp_encode.mkv`,
+  `.tmp.ab-av1-encoding.*`, `/tmp/mkv_*`) are removed on interrupt
+  and on the next start.
+
+Caches are plain JSON and safe to delete; the worst case is one
+slower run. Replacing a file while keeping its name and byte size
+fools the identity check — delete its `/tmp` entries then.
+
+Exit codes: 0 means the file was compressed (or the run only
+re-checked a finished job); 1 means nothing was written — bad
+arguments, a declined `.bak` overwrite, a failed search/encode, or
+"nothing to compress" (every stream already fits the targets, the
+file is left unchanged). Ctrl+C stops the run and cleans up.
 
 Memory: a preset-3 1080p encode needs several gigabytes of free RAM.
 If ffmpeg dies with no message, look for an out-of-memory kill
@@ -139,7 +172,8 @@ encode. Every bar appears at once, before its slow work starts.
 
 Result lines share one shape too, each tagged by stream:
 
-- `- sound 1: vbr 48 SI-SDR 32 (20%)`, `- sound 2: copy (100%)`;
+- `- sound 1: vbr 48 SI-SDR 32 (20%)`, `- sound 2: copy (100%)`
+  (one track is not numbered: `- sound: vbr 48 SI-SDR 32 (20%)`);
 - `- hqdn3d-strong, 5:5:8:8 (34%)`, `- off`;
 - `- crop 1920:800:0:140`, `- crop off`.
 
