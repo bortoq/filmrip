@@ -22,3 +22,7 @@ jobs:
         run: pip install pytest
       - name: Run tests
         run: python -m pytest tests/ -q
+      - name: Install pyflakes
+        run: pip install pyflakes
+      - name: Lint
+        run: python -m pyflakes mkv_encode.py tests/test_mkv_encode.py

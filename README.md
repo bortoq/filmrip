@@ -46,18 +46,30 @@ mkv_encode.py --crop film.mkv    # cut black bars first
 - `--vmaf` — target video VMAF (same scale as ab-av1)
 - `--sdr` — subjective audio quality **0..100**, mapped linearly to
   SI-SDR (`--sdr 100` → 25 dB). The search probes 30 short places
-  to rank them by difficulty, bisects the bitrate ladder on the 3
-  hardest, and takes the median need.
+  to rank them by difficulty, bisects the bitrate ladder on the 6
+  hardest, refines each need to an exact verified bitrate, and takes
+  the maximum: every checked place meets the target.
 - `--noise` — grain removal. The program probes 3 short samples
   with a fast encode (source vs each filter) and races `removegrain`,
   `fftdnoiz` (+strong sigma), `hqdn3d` (+strong), `atadenoise`;
   filters slower than ~30 seconds per sample are out. The winner is
-  used (`off` under 5% removable grain); the grain model level (4/8/12)
-  follows the measured share. Every mode stores an AV1 grain model,
-  so the decoder paints grain back.  Leave it off for animation.
-- `--crop` — probe gray frames in 3 windows and cut rows/columns
-  dark in nearly every frame (`- crop 1920:800:0:140`, `- crop off`
-  when unclear). One bright flash cannot widen the area.
+  used (`off` under 5% removable grain); the grain model level
+  (12/24/40) follows the measured share, restoring about as much
+  grain energy as the filter removed (measured live). Every mode
+  stores an AV1 grain model, so the decoder paints grain back.
+  Single pass only: the codec's internal denoiser
+  (`film-grain-denoise=0`) is off whenever an external filter runs.
+  Leave it off for animation.
+  VMAF is scored against the unfiltered source (the reference keeps
+  the crop but never the denoise), so the target means the same with
+  and without `--noise` — at the price of a lower CRF when grain is
+  removed.
+- `--crop` — run an 8-bit `bbox` pass over 3 windows and cut
+  the agreed content box (`- crop 1920:800:0:140`, `- crop off`
+  when unclear). Every frame reports its exact box; top/bottom
+  edges hold in 90% of frames, side edges need 99% (dark scene
+  corners must never pass for bars). Edges snap outward to even
+  coordinates, so no content pixel is ever cut.
   Same crop goes to `crf-search` and `encode`, with its own cache
   key; chains with `--noise` into one filter.
 
@@ -102,9 +114,9 @@ python3 -m pytest tests/
 
 1. Audio: for each track, 30 short places (5 seconds each) are
    probed at the middle bitrate to rank them by difficulty, then the
-   bitrate ladder is bisected on the 3 hardest places (10-second
-   samples). The median need wins: typical hard content keeps
-   the target at the lowest bitrate.
+   bitrate ladder is bisected on the 6 hardest places (10-second
+   samples). The maximum need wins: every checked place meets
+   the target.
 2. Video: `ab-av1 crf-search` finds the highest CRF that still hits the
    VMAF target, then `ab-av1 encode` compresses the file.
 
@@ -145,11 +157,21 @@ Caches are plain JSON and safe to delete; the worst case is one
 slower run. Replacing a file while keeping its name and byte size
 fools the identity check — delete its `/tmp` entries then.
 
-Exit codes: 0 means the file was compressed (or the run only
-re-checked a finished job); 1 means nothing was written — bad
-arguments, a declined `.bak` overwrite, a failed search/encode, or
-"nothing to compress" (every stream already fits the targets, the
-file is left unchanged). Ctrl+C stops the run and cleans up.
+## Exit codes
+
+0 means the file was compressed; 1 means nothing was written —
+bad arguments, a declined `.bak` overwrite, a failed search/encode,
+or "nothing to compress" (every stream already fits the targets,
+the file is left unchanged). Ctrl+C stops the run and cleans up.
+
+## Debugging
+
+`--debug` turns off every progress bar and writes a plain-text log
+to stderr instead: targets, ladder, hardest places, per-place needs,
+CRF attempts, and the exact commands. Nothing is drawn, so the log
+is safe to redirect to a file.
+
+`--denoise` is a hidden alias of `--noise` (kept for old scripts).
 
 Memory: a preset-3 1080p encode needs several gigabytes of free RAM.
 If ffmpeg dies with no message, look for an out-of-memory kill
@@ -169,6 +191,12 @@ spinner, clock, name, wide bar, and `(metric, eta 2m)` on the right.
 No brackets, no step counts. One bar at a time: grain probe, then
 one audio bar per track, then the ab-av1 bars for crf-search and
 encode. Every bar appears at once, before its slow work starts.
+
+No foreign lines stay on screen: `crf-search` runs with stderr on
+a sized pty that is relayed verbatim except ab-av1's trailing
+`Encode with:` hint line, which is filtered out exactly (per-line
+match, never length guessing). If the relay cannot start, stderr is
+inherited and the hint is erased afterwards as a fallback.
 
 Result lines share one shape too, each tagged by stream:
 

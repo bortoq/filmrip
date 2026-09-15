@@ -121,17 +121,17 @@ def test_svt_args_filter_modes():
 def test_make_cache_id_filter_modes():
     base = m.make_cache_id("f.mkv", 100, 94, 72)
     assert m.make_cache_id("f.mkv", 100, 94, 72,
-                           denoise="hqdn3d") == base + ".noisehqdn3d8"
+                           denoise="hqdn3d") == base + ".noisehqdn3d8h"
     assert m.make_cache_id("f.mkv", 100, 94, 72,
-                           denoise="hqdn3d:12") == base + ".noisehqdn3d12"
+                           denoise="hqdn3d:12") == base + ".noisehqdn3d12h"
     assert m.make_cache_id("f.mkv", 100, 94, 72,
-                           denoise="atadenoise") == base + ".noiseatadenoise8"
+                           denoise="atadenoise") == base + ".noiseatadenoise8h"
     assert m.make_cache_id("f.mkv", 100, 94, 72,
-                           denoise="hqdn3d") != base + ".noisefftdnoiz8"
+                           denoise="hqdn3d") != base + ".noisefftdnoiz8h"
     assert m.make_cache_id("f.mkv", 100, 94, 72,
-                           denoise="removegrain") == base + ".noiseremovegrain8"
+                           denoise="removegrain") == base + ".noiseremovegrain8h"
     assert m.make_cache_id("f.mkv", 100, 94, 72,
-                           denoise="fftdnoiz:12") == base + ".noisefftdnoiz12"
+                           denoise="fftdnoiz:12") == base + ".noisefftdnoiz12h"
 
 
 def test_svt_args_levels():
@@ -146,9 +146,9 @@ def test_make_cache_id_modes():
     assert base == "f.mkv.100b.vmaf94.sdr72"
     # deprecated bool alias maps to the hqdn3d default
     assert m.make_cache_id("f.mkv", 100, 94, 72,
-                           noise=True) == base + ".noisehqdn3d8"
+                           noise=True) == base + ".noisehqdn3d8h"
     assert m.make_cache_id("f.mkv", 100, 94, 72,
-                           denoise="hqdn3d") == base + ".noisehqdn3d8"
+                           denoise="hqdn3d") == base + ".noisehqdn3d8h"
     assert m.make_cache_id("f.mkv", 100, 94, 72, denoise=None) == base
     assert m.make_cache_id("f.mkv", 100, 94, 72, denoise="hqdn3d:4") != \
         m.make_cache_id("f.mkv", 100, 94, 72, denoise="hqdn3d:12")
@@ -215,49 +215,6 @@ def test_video_size(monkeypatch, tmp_path):
     assert m.video_size("/no/file.mkv") == (None, None)
 
 
-def _bars_frame(top=34, bottom=34, w=480, h=270):
-    px = bytearray(b"\x80" * (w * h))
-    for y in list(range(top)) + list(range(h - bottom, h)):
-        for x in range(w):
-            px[y * w + x] = 0
-    return bytes(px)
-
-
-def test_detect_crop_consensus(monkeypatch, tmp_path):
-    film = tmp_path / "c.mkv"
-    film.write_bytes(b"0" * 1024)
-    monkeypatch.setattr(m, "video_size", lambda _p: (1920, 1080))
-    monkeypatch.setattr(m, "grab_gray_frame",
-                        lambda _p, _s: _bars_frame())
-    assert m.detect_crop(str(film), 6000.0) == "1920:808:0:136"
-
-
-def test_detect_crop_tolerates_flash(monkeypatch, tmp_path):
-    film = tmp_path / "c.mkv"
-    film.write_bytes(b"0" * 1024)
-    monkeypatch.setattr(m, "video_size", lambda _p: (1920, 1080))
-    calls = {"n": 0}
-
-    def _grab(_p, _s):
-        calls["n"] += 1
-        if calls["n"] % 12 == 0:
-            return bytes(b"\xff" * (480 * 270))  # full-frame flash
-        return _bars_frame()
-
-    monkeypatch.setattr(m, "grab_gray_frame", _grab)
-    assert m.detect_crop(str(film), 6000.0) == "1920:808:0:136"
-
-
-def test_detect_crop_no_consensus(monkeypatch, tmp_path):
-    film = tmp_path / "c.mkv"
-    film.write_bytes(b"0" * 1024)
-    monkeypatch.setattr(m, "video_size", lambda _p: (1920, 1080))
-    monkeypatch.setattr(m, "grab_gray_frame", lambda _p, _s: None)
-    assert m.detect_crop(str(film), 6000.0) is None
-    assert m.detect_crop("/no/file.mkv", 6000.0) is None
-    assert m.detect_crop(str(film), 0) is None
-
-
 def test_ensure_abav1_temp_reuses(monkeypatch, tmp_path):
     monkeypatch.setattr(m.tempfile, "mkdtemp",
                         lambda prefix="": str(tmp_path))
@@ -320,42 +277,93 @@ def test_fmt_eta():
     assert m._spinner_eta(0, 0, 5) is None
 
 
-def test_dark_borders():
-    rows, cols = m.dark_borders(_bars_frame(), 480, 270)
-    assert rows[:34] == [True] * 34
-    assert rows[34] is False
-    assert rows[-34:] == [True] * 34
-    assert cols == [False] * 480
-    assert m.dark_borders(b"\x00" * 10, 480, 270) == ([], [])
-    assert m.dark_borders(None, 480, 270) == ([], [])
-    assert m.dark_borders(bytes(b"\xff" * (480 * 270)), 480, 270,
-                          limit=24)[0] == [False] * 270
+def _bbox_line(x1, x2, y1, y2, n=0):
+    return (f"[Parsed_bbox_1 @ 0x1] n:{n} pts:{n} pts_time:0.0 "
+            f"x1:{x1} x2:{x2} y1:{y1} y2:{y2} "
+            f"w:{x2 - x1 + 1} h:{y2 - y1 + 1} "
+            f"crop={x2 - x1 + 1}:{y2 - y1 + 1}:{x1}:{y1}")
 
 
-def test_grab_gray_frame_guards(tmp_path):
-    assert m.grab_gray_frame("/no/file.mkv", 1.0) is None
-    assert m.grab_gray_frame(None, 1.0) is None
-    assert m.grab_gray_frame(str(tmp_path / "x"), -1.0) is None
+def _bbox_err(boxes):
+    return "\n".join(_bbox_line(*b, n=i) for i, b in enumerate(boxes))
 
 
-def test_pick_crop():
-    rows = [10] * 34 + [0] * 202 + [10] * 34
-    cols = [0] * 480
-    assert m.pick_crop(rows, cols, 10, 1920, 1080) == "1920:808:0:136"
-    # thin bars are ignored
-    assert m.pick_crop([10] + [0] * 269, [0] * 480, 10,
-                       1920, 1080) is None
-    # nothing dark anywhere
-    assert m.pick_crop([0] * 270, [0] * 480, 10, 1920, 1080) is None
+def test_detect_crop_consensus(monkeypatch, tmp_path):
+    film = tmp_path / "c.mkv"
+    film.write_bytes(b"0" * 1024)
+    monkeypatch.setattr(m, "video_size", lambda _p: (1920, 1080))
+    boxes = [(0, 1919, 136, 943)] * 200
+    monkeypatch.setattr(m, "run_quiet",
+                        lambda cmd: _res(0, "", _bbox_err(boxes)))
+    assert m.detect_crop(str(film), 6000.0) == "1920:808:0:136"
+
+
+def test_detect_crop_tolerates_flash(monkeypatch, tmp_path):
+    film = tmp_path / "c.mkv"
+    film.write_bytes(b"0" * 1024)
+    monkeypatch.setattr(m, "video_size", lambda _p: (1920, 1080))
+    boxes = [(0, 1919, 136, 943)] * 190 + [(0, 1919, 0, 1079)] * 10
+    monkeypatch.setattr(m, "run_quiet",
+                        lambda cmd: _res(0, "", _bbox_err(boxes)))
+    assert m.detect_crop(str(film), 6000.0) == "1920:808:0:136"
+
+
+def test_detect_crop_keeps_dark_sides(monkeypatch, tmp_path):
+    # dark scene corners must not pass for pillarbox bars: side
+    # edges need near-unanimity, so a few narrow boxes change nothing
+    film = tmp_path / "c.mkv"
+    film.write_bytes(b"0" * 1024)
+    monkeypatch.setattr(m, "video_size", lambda _p: (1920, 1080))
+    boxes = [(0, 1919, 136, 943)] * 195 + [(100, 1819, 136, 943)] * 5
+    monkeypatch.setattr(m, "run_quiet",
+                        lambda cmd: _res(0, "", _bbox_err(boxes)))
+    assert m.detect_crop(str(film), 6000.0) == "1920:808:0:136"
+
+
+def test_detect_crop_no_consensus(monkeypatch, tmp_path):
+    film = tmp_path / "c.mkv"
+    film.write_bytes(b"0" * 1024)
+    monkeypatch.setattr(m, "video_size", lambda _p: (1920, 1080))
+    monkeypatch.setattr(m, "run_quiet", lambda cmd: _res(0, "", "nothing"))
+    assert m.detect_crop(str(film), 6000.0) is None
+    assert m.detect_crop("/no/file.mkv", 6000.0) is None
+    assert m.detect_crop(str(film), 0) is None
+
+
+def test_parse_bbox_line():
+    line = ("[Parsed_bbox_1 @ 0x1] n:0 pts:8 pts_time:0.008 "
+            "x1:140 x2:1523 y1:137 y2:942 w:1384 h:806")
+    assert m.parse_bbox_line(line) == (140, 1523, 137, 942)
+    assert m.parse_bbox_line("n:0 pts:0 pts_time:0") is None  # dark frame
+    assert m.parse_bbox_line("no box here") is None
+    assert m.parse_bbox_line("") is None
+    assert m.parse_bbox_line(None) is None
+    assert m.parse_bbox_line("x1:5 x2:3 y1:0 y2:10") is None
+
+
+def test_pick_crop_box():
+    bars = [(0, 1919, 136, 943)] * 90 + [(0, 1919, 0, 1079)] * 10
+    x1s = [b[0] for b in bars]
+    x2s = [b[1] for b in bars]
+    y1s = [b[2] for b in bars]
+    y2s = [b[3] for b in bars]
+    assert m.pick_crop_box(x1s, x2s, y1s, y2s, 1920, 1080) == \
+        "1920:808:0:136"
+    # full-frame boxes mean no bars
+    full = [(0, 1919, 0, 1079)] * 100
+    assert m.pick_crop_box([b[0] for b in full], [b[1] for b in full],
+                           [b[2] for b in full], [b[3] for b in full],
+                           1920, 1080) is None
     # guards
-    assert m.pick_crop([], [], 10, 1920, 1080) is None
-    assert m.pick_crop(rows, cols, 0, 1920, 1080) is None
-    assert m.pick_crop(rows, cols, 10, None, 1080) is None
-    # outside the frame or tiny area is rejected
-    assert m.pick_crop([10] * 270, [10] * 480, 10,
-                       1920, 1080) is None
-    assert m.pick_crop([10] * 200 + [0] * 70, [0] * 480, 10,
-                       1920, 1080) is None
+    assert m.pick_crop_box([], [], [], [], 1920, 1080) is None
+    assert m.pick_crop_box(x1s, x2s, y1s, y2s, None, 1080) is None
+    assert m.pick_crop_box(x1s, x2s, y1s, None, 1920, 1080) is None
+    assert m.pick_crop_box(x1s, x2s, y1s, y2s[:50], 1920, 1080) is None
+    # edges snap outward to even, content is never cut
+    odd = [(1, 1918, 137, 942)] * 100
+    assert m.pick_crop_box([b[0] for b in odd], [b[1] for b in odd],
+                           [b[2] for b in odd], [b[3] for b in odd],
+                           1920, 1080) == "1920:808:0:136"
 
 
 def test_abav1_hint_rows():
@@ -395,6 +403,306 @@ def test_crop_verdict_cache(tmp_path):
     m.save_crop_verdict("", "1920:800:0:140")  # must not raise
 
 
+def test_noise_verdict_version_rejected(tmp_path):
+    f = tmp_path / "old.json"
+    f.write_text('{"mode": "hqdn3d:8", "share": 0.25}', encoding="utf-8")
+    assert m.load_noise_verdict(str(f)) is None
+
+
+def test_noise_verdict_fuzz(tmp_path):
+    for bad in ('{"mode": 5, "share": 0.5}',
+                '{"mode": "hqdn3d:8", "share": "0.5"}',
+                '{"mode": "hqdn3d:8", "share": true}',
+                '{"mode": "nlmeans:8", "share": 0.5}',
+                '{"mode": "", "share": 0.5}',
+                '[1, 2]'):
+        f = tmp_path / "v.json"
+        f.write_text(bad, encoding="utf-8")
+        assert m.load_noise_verdict(str(f)) is None
+    # out-of-range level loads (algo is valid) but never resolves:
+    # resolve failure means "off", never a crash
+    f = tmp_path / "v.json"
+    f.write_text('{"v": 2, "mode": "hqdn3d:99", "share": 0.5}', encoding="utf-8")
+    assert m.load_noise_verdict(str(f)) == {"mode": "hqdn3d:99",
+                                            "share": 0.5}
+    try:
+        m.svt_args_for_denoise("hqdn3d:99")
+        assert False, "must reject"
+    except ValueError:
+        pass
+
+
+def test_crop_verdict_fuzz(tmp_path):
+    for bad in ('{"area": "0:0:0:0"}',
+                '{"area": "a:b:c:d"}',
+                '{"area": "1920:800:0"}',
+                '{"area": "-10:800:0:140"}',
+                '{"area": 42}',
+                '{"area": "1920:800:0:140:5"}'):
+        f = tmp_path / "c.json"
+        f.write_text(bad, encoding="utf-8")
+        assert m.load_crop_verdict(str(f)) is None
+
+
+def test_pick_secant_probes_fail(monkeypatch, tmp_path):
+    # the secant candidate fails to encode: keep the verified hit
+    _asisdr_ok(monkeypatch)
+    monkeypatch.setattr(m, "extract_sample", lambda *a, **k: True)
+    monkeypatch.setattr(m, "active_channels", lambda ref: [0])
+    monkeypatch.setattr(m, "encode_opus", lambda ref, br, out: br != 44)
+    scores = {24: 10.0, 32: 12.0, 40: 14.0, 48: 18.0}
+
+    def fake_measure(ref, enc, active):
+        import re
+        mm = re.search(r"enc_(\d+)", enc)
+        return scores.get(int(mm.group(1)), 99.0)
+
+    monkeypatch.setattr(m, "measure_sisdr", fake_measure)
+    monkeypatch.setattr(m.tempfile, "mkdtemp",
+                        lambda prefix="": str(tmp_path))
+    monkeypatch.setattr(m.shutil, "rmtree", lambda *a, **k: None)
+    assert m.pick_audio_bitrate("f", _track(), 16.0,
+                                100.0) == (48, "search", 18.0, 38)
+
+
+def test_pick_floor_hit_no_secant(monkeypatch, tmp_path):
+    # target already met at the ladder floor: no bracket, no secant
+    _mock_search(monkeypatch, {24: 20.0}, tmp_path)
+    assert m.pick_audio_bitrate("f", _track(), 16.0,
+                                100.0) == (24, "search", 20.0, 19)
+
+
+def test_main_legacy_crf_inf_researches(monkeypatch, tmp_path):
+    # planted `inf` sidecar must not reach --crf: search runs again
+    film = tmp_path / "infc.mkv"
+    film.write_bytes(b"0" * 1024)
+    size = film.stat().st_size
+    (tmp_path / f"infc.mkv.{size}b.vmaf94.0.crf").write_text(
+        "inf", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["mkv_encode.py", str(film)])
+    monkeypatch.setattr(m, "probe", lambda _p: (100.0, []))
+    monkeypatch.setattr(m, "CACHE_DIR", str(tmp_path))
+    calls = {"n": 0}
+
+    def fake_search(*a, **k):
+        calls["n"] += 1
+        return 25.0, [], False
+
+    monkeypatch.setattr(m, "run_crf_search", fake_search)
+
+    class _Proc:
+        pid = 4242
+
+        def wait(self, timeout=None):
+            return 1
+
+    monkeypatch.setattr(m, "_spawn", lambda *a, **k: _Proc())
+    saved = (set(m._CLEANUP_FILES), set(m._CLEANUP_DIRS),
+             list(m._CHILD_PROCS))
+    m._CLEANUP_FILES.clear()
+    m._CLEANUP_DIRS.clear()
+    m._CHILD_PROCS.clear()
+    try:
+        m.main()
+        assert calls["n"] == 1
+    finally:
+        m._CLEANUP_FILES.clear()
+        m._CLEANUP_FILES.update(saved[0])
+        m._CLEANUP_DIRS.clear()
+        m._CLEANUP_DIRS.update(saved[1])
+        m._CHILD_PROCS.clear()
+        m._CHILD_PROCS.extend(saved[2])
+
+
+def test_measure_grain_times_without_raw(monkeypatch, tmp_path):
+    # raw probe #0 fails: filter times are still measured, the cap
+    # still applies, scores come from the later samples
+    film = tmp_path / "t.mkv"
+    film.write_bytes(b"0" * 1024)
+
+    def fake_run(cmd):
+        if "-f" in cmd:
+            return _res(0, "", "")
+        out = cmd[-1]
+        base = os.path.basename(out)
+        if base.startswith("raw_0"):
+            return _res(1, "", "e")
+        n = {"raw_": 1000}.get(base[:4], 850)
+        if "removegrain" in base:
+            n = 700
+        with open(out, "wb") as f:
+            f.write(b"x" * n)
+        return _res(0, "", "")
+
+    monkeypatch.setattr(m, "run_quiet", fake_run)
+    scores, times = m.measure_grain(str(film), 600.0)
+    assert set(times) == set(m.FILTER_CANDIDATES)
+    assert abs(scores["removegrain"] - 0.3) < 1e-9
+
+
+def test_hint_filter_passes_bar():
+    f = m._HintFilter()
+    esc = b"\x1b"
+    bar = (esc + b"[2K* 00:00:01 crf 21.75 "
+           b"\r" + esc + b"[2K+ 00:00:02 crf 21.75 \r")
+    assert f.feed(bar) == bar
+    assert f.flush() == b""
+
+
+def test_hint_filter_drops_hint():
+    f = m._HintFilter()
+    hint = (b"Encode with: ab-av1 encode -i '/m/Mandy (2018).mkv' "
+            b"--crf 21.75 --preset 3\n")
+    assert f.feed(b"bar done\n") == b"bar done\n"
+    assert f.feed(hint) == b""
+    assert f.feed(b"next\n") == b"next\n"
+
+
+def test_hint_filter_split_feeds():
+    f = m._HintFilter()
+    assert f.feed(b"Encode wi") == b""
+    assert f.feed(b"th: ab-av1 encode -i f.mkv\n") == b""
+    assert f.feed(b"after\n") == b"after\n"
+
+
+def test_hint_filter_cr_before_hint():
+    f = m._HintFilter()
+    assert f.feed(b"\x1b[2Kbar\rEncode with: x\n") == b"\x1b[2Kbar\r"
+    assert f.feed(None) == b""
+    assert f.feed("not-bytes") == b""
+
+
+def test_hint_filter_flush_forwards_tail():
+    f = m._HintFilter()
+    assert f.feed(b"partial") == b"partial"
+    assert f.feed(b"\nEncode") == b"\n"
+    assert f.flush() == b"Encode"
+
+
+def test_crf_search_uses_pty_on_tty(monkeypatch):
+    seen = {}
+
+    class _FakeOut:
+        def __init__(self, lines):
+            self._lines = lines
+
+        def __iter__(self):
+            return iter(self._lines)
+
+        def close(self):
+            pass
+
+    class _FakePopen:
+        pid = 4242
+        returncode = 0
+
+        def __init__(self, lines):
+            self.stdout = _FakeOut(lines)
+            self.stderr = None
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_pty(cmd, **k):
+        import os as _os
+        seen["pty"] = True
+        assert k.get("stderr", None) is None  # slave passed positionally
+        rd, wr = _os.pipe()
+        _os.close(wr)  # instant EOF for the pump thread
+        return _FakePopen(['{"type":"crf-search-done","crf":21.0}\n']), rd
+
+    monkeypatch.setattr(m, "_use_color", lambda: True)
+    monkeypatch.setattr(m, "_spawn_pty", fake_pty)
+    monkeypatch.setattr(m, "ensure_abav1_temp", lambda: "/tmp/fake_abav1")
+    crf, _, _ = m.run_crf_search("f.mkv", 94)
+    assert crf == 21.0
+    assert seen.get("pty") is True
+
+
+def test_crf_search_falls_back_without_pty(monkeypatch):
+    seen = {}
+
+    class _FakeOut:
+        def __init__(self, lines):
+            self._lines = lines
+
+        def __iter__(self):
+            return iter(self._lines)
+
+        def close(self):
+            pass
+
+    class _FakePopen:
+        pid = 4242
+        returncode = 0
+
+        def __init__(self, lines):
+            self.stdout = _FakeOut(lines)
+            self.stderr = None
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_spawn(cmd, **k):
+        seen["stderr"] = k.get("stderr", "unset")
+        return _FakePopen(['{"type":"crf-search-done","crf":21.0}\n'])
+
+    def no_pty(cmd, **k):
+        raise OSError("no pty")
+
+    monkeypatch.setattr(m, "_use_color", lambda: True)
+    monkeypatch.setattr(m, "_spawn_pty", no_pty)
+    monkeypatch.setattr(m, "_spawn", fake_spawn)
+    monkeypatch.setattr(m, "ensure_abav1_temp", lambda: "/tmp/fake_abav1")
+    crf, _, _ = m.run_crf_search("f.mkv", 94)
+    assert crf == 21.0
+    assert seen.get("stderr") is None  # plain inherit
+
+
+def test_crf_search_ref_vfilter():
+    seen = {}
+
+    class _FakeOut:
+        def __init__(self, lines):
+            self._lines = lines
+
+        def __iter__(self):
+            return iter(self._lines)
+
+        def close(self):
+            pass
+
+    class _FakePopen:
+        pid = 4242
+        returncode = 0
+
+        def __init__(self, lines):
+            self.stdout = _FakeOut(lines)
+            self.stderr = None
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(cmd, **k):
+        seen["cmd"] = cmd
+        return _FakePopen(
+            ['{"type":"crf-search-done","crf":21.0,"vmaf":94.0}\n'])
+
+    import subprocess as _sp
+    _orig = _sp.Popen
+    _sp.Popen = fake_popen
+    try:
+        crf, _, _ = m.run_crf_search(
+            "f.mkv", 94, vfilter="hqdn3d=5:5:8:8", ref_vfilter="null")
+        assert crf == 21.0
+        assert "--reference-vfilter" in seen["cmd"]
+        assert "null" in seen["cmd"]
+        crf, _, _ = m.run_crf_search("f.mkv", 94)
+        assert "--reference-vfilter" not in seen["cmd"]
+    finally:
+        _sp.Popen = _orig
+
+
 def test_make_cache_id_crop_offsets():
     base = m.make_cache_id("f.mkv", 100, 94, 72)
     plain = m.make_cache_id("f.mkv", 100, 94, 72, crop="1920:800:0:0")
@@ -408,7 +716,7 @@ def test_make_cache_id_crop():
                            crop="1920:800:0:140") == base + ".crop1920x800+0+140"
     assert m.make_cache_id("f.mkv", 100, 94, 72, denoise="hqdn3d",
                            crop="1920:800:0:140") == \
-        base + ".noisehqdn3d8.crop1920x800+0+140"
+        base + ".noisehqdn3d8h.crop1920x800+0+140"
     assert m.make_cache_id("f.mkv", 100, 94, 72, crop="bogus") == base
 
 
@@ -936,7 +1244,7 @@ def test_pick_ranks_hardest_places(monkeypatch, tmp_path):
         "f", _track(), 15.0, 3600.0)
     assert (br, method) == (64, "search")
     assert score == 15.0
-    assert len(set(calls["refine_extracts"])) == 3
+    assert len(set(calls["refine_extracts"])) == 6
 
 
 def test_pick_bisect_budget(monkeypatch, tmp_path):
@@ -950,9 +1258,9 @@ def test_pick_bisect_budget(monkeypatch, tmp_path):
     br, method, _score, _pct = m.pick_audio_bitrate(
         "f", _track(), 15.0, 3600.0)
     assert (br, method) == (64, "search")
-    # 30 rank probes + 3 refines x at most 12 probes each
+    # 30 rank probes + 6 refines x at most 12 probes each
     # (bisection + walk-down + secant)
-    assert calls["encode"] <= 30 + 3 * 12
+    assert calls["encode"] <= 30 + 6 * 12
 
 
 def test_pick_max_across_places(monkeypatch, tmp_path):
@@ -965,9 +1273,9 @@ def test_pick_max_across_places(monkeypatch, tmp_path):
     assert (br, method) == (80, "search")
 
 
-def test_pick_median_of_hard_places(monkeypatch, tmp_path):
-    # refine_0 is hard (needs 80k at target 18), refine_1/2 are easy
-    # (need 24k): median picks 24k, not the max.
+def test_pick_max_of_hard_places(monkeypatch, tmp_path):
+    # refine_0 is hard (needs 80k at target 18), the rest are easy
+    # (need 24k): max picks 80k, so every checked segment meets target.
     _asisdr_ok(monkeypatch)
     hard = {24: 5.0, 32: 8.0, 40: 12.0, 48: 14.0, 56: 14.9,
             64: 15.0, 72: 16.0, 80: 18.0, 96: 20.0}
@@ -988,7 +1296,7 @@ def test_pick_median_of_hard_places(monkeypatch, tmp_path):
                         lambda prefix="": str(tmp_path))
     monkeypatch.setattr(m.shutil, "rmtree", lambda *a, **k: None)
     assert m.pick_audio_bitrate("f", _track(), 18.0,
-                                3600.0) == (24, "search", 99.0, 19)
+                                3600.0) == (80, "search", 18.0, 62)
 
 
 def test_pick_unreachable_place_warned(monkeypatch, tmp_path, capsys):
@@ -1018,7 +1326,7 @@ def test_noise_verdict_cache(tmp_path):
     good = tmp_path / "n.json"
     m.save_noise_verdict(str(good), "hqdn3d-strong:8", 0.25)
     assert m.load_noise_verdict(str(good)) == {"mode": "hqdn3d-strong:8",
-                                               "share": 0.25}
+                                                  "share": 0.25}
     off = tmp_path / "off.json"
     m.save_noise_verdict(str(off), None, None)
     assert m.load_noise_verdict(str(off)) == {"mode": None,
@@ -1046,19 +1354,19 @@ def test_auto_pick_mode():
     assert m.auto_pick_mode({"removegrain": None, "fftdnoiz": None}) is None
     assert m.auto_pick_mode({"removegrain": 0.03, "fftdnoiz": 0.02}) is None
     assert m.auto_pick_mode({"removegrain": 0.06,
-                             "fftdnoiz": 0.02}) == "removegrain:4"
+                             "fftdnoiz": 0.02}) == "removegrain:12"
     assert m.auto_pick_mode({"removegrain": 0.15,
-                             "fftdnoiz": 0.02}) == "removegrain:8"
+                             "fftdnoiz": 0.02}) == "removegrain:24"
     assert m.auto_pick_mode({"removegrain": 0.06,
-                             "fftdnoiz": 0.12}) == "fftdnoiz:8"
-    assert m.auto_pick_mode({"removegrain": 0.3}) == "removegrain:12"
-    assert m.auto_pick_mode({"removegrain": 0.08}) == "removegrain:4"
+                             "fftdnoiz": 0.12}) == "fftdnoiz:24"
+    assert m.auto_pick_mode({"removegrain": 0.3}) == "removegrain:40"
+    assert m.auto_pick_mode({"removegrain": 0.08}) == "removegrain:12"
     assert m.auto_pick_mode(None) is None
     assert m.auto_pick_mode("bad") is None
     # over-budget filters are out even when winning on removal
     assert m.auto_pick_mode({"removegrain": 0.3, "fftdnoiz": 0.1},
                             {"removegrain": 120.0,
-                             "fftdnoiz": 5.0}) == "fftdnoiz:8"
+                             "fftdnoiz": 5.0}) == "fftdnoiz:24"
 
 
 def test_format_grain_result():
@@ -1085,12 +1393,19 @@ def test_spinner_bar_name_in_tail(monkeypatch, capsys):
     assert "[" not in err and "]" not in err
 
 
+def test_denoise_single_pass():
+    for algo in m.FILTER_CANDIDATES:
+        svt = m.svt_args_for_denoise(f"{algo}:12")
+        assert "film-grain-denoise=0" in svt
+        assert "film-grain=12" in svt
+
+
 def test_grain_level_for():
-    assert m.grain_level_for(0.0) == 4
-    assert m.grain_level_for(0.09) == 4
-    assert m.grain_level_for(0.10) == 8
-    assert m.grain_level_for(0.25) == 8
-    assert m.grain_level_for(0.26) == 12
+    assert m.grain_level_for(0.0) == 12
+    assert m.grain_level_for(0.09) == 12
+    assert m.grain_level_for(0.10) == 24
+    assert m.grain_level_for(0.20) == 24
+    assert m.grain_level_for(0.21) == 40
     assert m.grain_level_for(None) == 8
     assert m.grain_level_for(float("nan")) == 8
 
@@ -1123,7 +1438,7 @@ def test_measure_grain_mocked(monkeypatch, tmp_path):
     scores, times = m.measure_grain(str(film), 600.0)
     assert abs(scores["removegrain"] - 0.3) < 1e-9
     assert abs(scores["fftdnoiz"] - 0.15) < 1e-9
-    assert m.auto_pick_mode(scores, times) == "removegrain:12"
+    assert m.auto_pick_mode(scores, times) == "removegrain:40"
     monkeypatch.setattr(m, "run_quiet", lambda cmd: _res(1, "", "e"))
     scores, _times = m.measure_grain(str(film), 600.0)
     assert set(scores) == set(m.FILTER_CANDIDATES)
@@ -1175,13 +1490,13 @@ def test_main_noise_auto_resolves(monkeypatch, tmp_path, capsys):
     assert "- removegrain" in err
     assert "grain auto" not in err
     import glob as _glob
-    assert _glob.glob(str(tmp_path / "auto.mkv.*.noiseremovegrain12.json"))
+    assert _glob.glob(str(tmp_path / "auto.mkv.*.noiseremovegrain40h.json"))
 
 
 def test_track_steps_budget():
-    assert m._track_steps() == 30 + 3 * 12
+    assert m._track_steps() == 30 + 6 * 12
     assert (m.RANK_POSITIONS, m.RANK_SECS, m.REFINE_TOP,
-            m.REFINE_SECS, m.BISECT_PROBES) == (30, 5.0, 3, 10.0, 6)
+            m.REFINE_SECS, m.BISECT_PROBES) == (30, 5.0, 6, 10.0, 6)
 
 
 def test_pick_sample_failure_copy(monkeypatch, tmp_path):

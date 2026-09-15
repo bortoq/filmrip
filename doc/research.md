@@ -64,7 +64,7 @@ synthesis. We mainly decide *when* and *how hard* to enable it.
 Implemented as `--noise` (no arguments): 3 short samples are encoded
 fast, raw vs each candidate filter; filters over ~30s per sample are
 out; the winner applies (`off` under 5% removable grain); the grain
-model level (4/8/12) follows the measured share. Leftover ideas:
+model level (12/24/40) follows the measured share. Leftover ideas:
 profile heuristic (film on, animation off), `bitplanenoise` metric.
 
 Neither SVT nor libaom auto-picks a perfect `film-grain` level for you.
@@ -94,9 +94,16 @@ FGS is on across a grainy catalog mix.
 
 ## VMAF caveat (important for us)
 
-ab-av1 picks CRF with VMAF. Synthesized grain is **not** the same
-pixels as the source grain. VMAF often sees the denoised/synth path
-as worse, so:
+ab-av1 picks CRF with VMAF. By default it scores the encode
+against the *filtered* reference, which hides the quality the
+denoise filter itself removes (measured 6 VMAF points on real
+content: 93.8 masked vs 88.8 honest for the same hqdn3d pass).
+Since the honest-reference change, `crf-search` gets
+`--reference-vfilter` with the crop only (`null` pass-through when
+there is no crop), so the `--vmaf` target means the same with and
+without `--noise`. Synthesized grain is **not** the same pixels as
+the source grain. VMAF often sees the denoised/synth path as worse,
+so:
 
 - the same `--vmaf` target may force a lower CRF / larger file, or
 - subjective quality may look fine while VMAF looks “bad”.
@@ -152,7 +159,8 @@ will show the cleaner (denoised) picture.
   `atadenoise` on 3 short samples (fast preset-10 encode, raw vs
   filtered); filters over ~30s per sample are out. The winner is
   used (`off` under 5% removable grain); the grain level follows
-  the share (4/8/12). The winning filter goes to `--vfilter` plus
+  the share (12/24/40, calibrated to restoration parity).
+  The winning filter goes to `--vfilter` plus
   `film-grain=N`, `film-grain-denoise=0` (real denoise; ab-av1
   scores VMAF against the filtered reference, so scores stay
   honest). Shares, times and pick are printed; the resolved
@@ -163,8 +171,9 @@ will show the cleaner (denoised) picture.
   kept finding visible grain left behind. There are no per-filter
   CLI modes: the race picks the filter.
 - `--crop` chains as `crop=w:h:x:y,<denoise filter>` in one
-  `--vfilter`: crop area (rows/columns dark in ~90% of 24 gray
-  probe frames across 3 windows, else off) has its own cache suffix
+  `--vfilter`: crop area (per-frame 8-bit bbox edges over
+  3 windows: top/bottom hold in 90% of frames, sides need 99%,
+  edges snap outward to even, else off) has its own cache suffix
   and does not disturb the denoise verdict. cropdetect is not used:
   its limit is not scaled to 10-bit sources, so bar noise counts as
   content and it latches onto the widest flash frame.
@@ -173,7 +182,7 @@ will show the cleaner (denoised) picture.
 ## Open questions
 
 1. Should the film profile default `--noise` on, and the animation profile off?
-2. Grain level calibration: auto picks 4/8/12 from the measured share; needs viewing data.
+2. Grain level calibration: auto picks 12/24/40 from the measured share (parity measured live on one film); needs wider viewing data.
 3. ~~Add cheap ffmpeg modes~~ done as race candidates.
 4. How to adjust `--vmaf` policy when denoise is on?
 5. Do we ever want `film-grain-denoise=0` with external denoise only?
