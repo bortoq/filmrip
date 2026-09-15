@@ -6,35 +6,59 @@ the quality you asked for.
 
 ## Setup
 
-Wrappers live in `~/bin` and call the script in this repo:
-
-- `mkvf` — film defaults: `--vmaf 94 --sdr 72`
-- `mkv` — animation defaults: `--vmaf 90 --sdr 60`
-- `mkv_encode.py` — the main script
+```sh
+git clone https://github.com/bortoq/filmrip.git
+cd filmrip
+```
 
 ## Needs
 
-- `ab-av1`
-- `ffmpeg` / `ffprobe` (with `libopus`, `asisdr`, `astats` filters)
-- `python3`
+- `ab-av1` — video search and encode.
+  Install: https://github.com/alexheretic/ab-av1/releases
+  (or `cargo install ab-av1`). Tested: 0.11.7.
+  Check: `ab-av1 --version`.
+- `ffmpeg` + `ffprobe` — audio search, filters, muxing.
+  Install: https://ffmpeg.org/download.html
+  (static builds include everything below).
+  Needs the `libopus` and `libsvtav1` encoders plus the `asisdr`,
+  `astats`, `cropdetect` filters. Tested: 8.1.
+  Check: `ffmpeg -hide_banner -h encoder=libopus`,
+  `ffmpeg -hide_banner -h filter=asisdr`.
+- `python3` (standard library only, no packages).
+  Check: `python3 --version`.
 
 ## Use
 
 ```sh
-mkvf film.mkv      # compress a film
-mkv cartoon.mkv    # compress animation
+python3 mkv_encode.py film.mkv
+python3 mkv_encode.py --vmaf 90 --sdr 60 cartoon.mkv   # animation
 ```
 
 Custom subjective targets:
 
 ```sh
 mkv_encode.py --vmaf 95 --sdr 90 film.mkv
+mkv_encode.py --noise film.mkv   # race filters, use winner
+mkv_encode.py --crop film.mkv    # cut black bars first
+                            # no flag = no denoise (default)
 ```
 
 - `--vmaf` — target video VMAF (same scale as ab-av1)
 - `--sdr` — subjective audio quality **0..100**, mapped linearly to
-  SI-SDR (`--sdr 100` → 25 dB). The search then picks the lowest Opus
-  bitrate that hits that SI-SDR on a mid-film sample.
+  SI-SDR (`--sdr 100` → 25 dB). The search probes 30 short places
+  to rank them by difficulty, bisects the bitrate ladder on the 3
+  hardest, and takes the median need.
+- `--noise` — grain removal. The program probes 3 short samples
+  with a fast encode (source vs each filter) and races `removegrain`,
+  `fftdnoiz` (+strong sigma), `hqdn3d` (+strong), `atadenoise`;
+  filters slower than ~30 seconds per sample are out. The winner is
+  used (`off` under 5% removable grain); the grain model level (4/8/12)
+  follows the measured share. Every mode stores an AV1 grain model,
+  so the decoder paints grain back.  Leave it off for animation.
+- `--crop` — detect black bars on 3 samples and cut the consensus
+  picture area (`- crop 1920:800:0:140`, `- crop off` when unclear).
+  Same crop goes to `crf-search` and `encode`, with its own cache
+  key; chains with `--noise` into one filter.
 
 Approximate Opus bitrate **per channel** for film-like audio
 (stereo total ≈ 2×; 5.1 total ≈ 6×):
@@ -75,9 +99,11 @@ python3 -m pytest tests/
 
 ## How it works
 
-1. Audio: for each track, a 60-second sample from the middle of the film
-   is encoded to Opus at low bitrates first. The lowest bitrate that
-   hits the SI-SDR target wins.
+1. Audio: for each track, 30 short places (5 seconds each) are
+   probed at the middle bitrate to rank them by difficulty, then the
+   bitrate ladder is bisected on the 3 hardest places (10-second
+   samples). The median need wins: typical hard content keeps
+   the target at the lowest bitrate.
 2. Video: `ab-av1 crf-search` finds the highest CRF that still hits the
    VMAF target, then `ab-av1 encode` compresses the file.
 
@@ -92,12 +118,34 @@ To save every byte:
 Search results (CRF + audio bitrates) are cached in `/tmp`, keyed by
 file name, size, and quality targets.
 
+Memory: a preset-3 1080p encode needs several gigabytes of free RAM.
+If ffmpeg dies with no message, look for an out-of-memory kill
+(`journalctl --since "24 hours ago" | grep -i "out of memory"`)
+and retry with heavy jobs stopped.
+
+If no CRF reaches the VMAF target within 80% of the source size
+(typical for efficient x265 sources at high targets), the video
+stream is kept as is and only the audio is compressed. The message
+shows the best sample VMAF, so you can lower `--vmaf` and try again.
+A crashed search is never remembered: the next run searches again.
+
 ## Output
 
-Only two things on screen:
+Every progress bar shares one template (the ab-av1 shape):
+spinner, clock, name, wide bar, and `(metric, eta 2m)` on the right.
+No brackets, no step counts. One bar at a time: grain probe, then
+one audio bar per track, then the ab-av1 bars for crf-search and
+encode. Every bar appears at once, before its slow work starts.
 
-1. one updating audio-search line (same `\r` style as ab-av1 encode);
-2. the normal `ab-av1` progress bars for crf-search and encode.
+Result lines share one shape too, each tagged by stream:
+
+- `- sound 1: vbr 48 SI-SDR 32 (20%)`, `- sound 2: copy (100%)`;
+- `- hqdn3d-strong, 5:5:8:8 (34%)`, `- off`;
+- `- crop 1920:800:0:140`, `- crop off`.
+
+Percents everywhere mean 100 * new size / old size, same as the
+ab-av1 percent. The screen is left clean: cursor back, colors reset,
+no half-drawn lines.
 
 `crf-search` is run with `--stdout-format json` so the script can read the
 chosen CRF from stdout while **stderr stays on the real terminal** — that
